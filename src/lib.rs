@@ -2,7 +2,7 @@ use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_dsql::auth_token::AuthTokenGenerator;
 use tls::TlsConnector;
 use tokio::task::JoinHandle;
-use tokio_postgres::{config::Host, Client, Config};
+use tokio_postgres::{Client, Config, config::Host};
 
 mod error;
 pub use error::Error;
@@ -41,6 +41,19 @@ impl Opts {
             connection: None,
         };
         c.reconnect().await?;
+        Ok(c)
+    }
+
+    /// Create a single connection without establishing an initial connection.
+    /// The connection will be established lazily on the first call to `borrow()`.
+    pub async fn lazy_one(&self) -> Result<SingleConnection, Error> {
+        let tls = tls::tls_connector()?;
+        let c = SingleConnection {
+            opts: self.clone(),
+            tls,
+            client: None,
+            connection: None,
+        };
         Ok(c)
     }
 }
