@@ -1,7 +1,12 @@
+use std::{ops, sync::Arc};
+
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_dsql::auth_token::AuthTokenGenerator;
 use tls::TlsConnector;
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard},
+    task::JoinHandle,
+};
 use tokio_postgres::{Client, Config, config::Host};
 
 mod error;
@@ -33,13 +38,7 @@ impl Opts {
     /// disconnected. This is suitable for lightweight environments that don't
     /// need a connection pool.
     pub async fn connect_one(&self) -> Result<SingleConnection, Error> {
-        let tls = tls::tls_connector()?;
-        let mut c = SingleConnection {
-            opts: self.clone(),
-            tls,
-            client: None,
-            connection: None,
-        };
+        let mut c = self.lazy_one().await?;
         c.reconnect().await?;
         Ok(c)
     }
@@ -48,29 +47,71 @@ impl Opts {
     /// The connection will be established lazily on the first call to `borrow()`.
     pub async fn lazy_one(&self) -> Result<SingleConnection, Error> {
         let tls = tls::tls_connector()?;
-        let c = SingleConnection {
+        let inner = Inner {
             opts: self.clone(),
             tls,
             client: None,
             connection: None,
         };
-        Ok(c)
+
+        Ok(SingleConnection {
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 }
 
 /// A single connection to Aurora DSQL. If disconnected, the connection will
 /// automatically reopen.
+#[derive(Clone)]
 pub struct SingleConnection {
+    inner: Arc<Mutex<Inner>>,
+}
+
+pub struct BorrowedClient {
+    _guard: OwnedMutexGuard<Inner>,
+    client: *mut Client,
+}
+
+impl ops::Deref for BorrowedClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        // safety: self._guard is live
+        unsafe { &*self.client }
+    }
+}
+
+impl ops::DerefMut for BorrowedClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // safety: self._guard is live
+        unsafe { &mut *self.client }
+    }
+}
+
+impl SingleConnection {
+    /// Returns a connected [`tokio_postgres::Client`]. If disconnected, attempt
+    /// to reconnect (once).
+    pub async fn borrow(&mut self) -> Result<BorrowedClient, Error> {
+        let mut _guard = self.inner.clone().lock_owned().await;
+        let client = _guard.borrow().await? as *mut _; // OwnedMutexGuard::map can't run async closures
+        Ok(BorrowedClient { _guard, client })
+    }
+
+    /// Close any existing connection, then open a new one.
+    pub async fn reconnect(&mut self) -> Result<(), Error> {
+        self.inner.clone().lock().await.reconnect().await
+    }
+}
+
+struct Inner {
     opts: Opts,
     tls: TlsConnector,
     client: Option<Client>,
     connection: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
 }
 
-impl SingleConnection {
-    /// Returns a connected [`tokio_postgres::Client`]. If disconnected, attempt
-    /// to reconnect (once).
-    pub async fn borrow(&mut self) -> Result<&mut Client, Error> {
+impl Inner {
+    async fn borrow(&mut self) -> Result<&mut Client, Error> {
         // First check if we need to reconnect (without borrowing client)
         let needs_reconnect = match (&self.client, &self.connection) {
             (Some(_), Some(connection)) => connection.is_finished(),
@@ -86,7 +127,7 @@ impl SingleConnection {
     }
 
     /// Close any existing connection, then open a new one.
-    pub async fn reconnect(&mut self) -> Result<(), Error> {
+    async fn reconnect(&mut self) -> Result<(), Error> {
         let mut config = self.opts.config.clone();
 
         let host = match config.get_hosts() {
